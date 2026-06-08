@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -e
+
 FRP_VERSION=$(cat ../../version.txt)
 
 unset GO111MODULE
