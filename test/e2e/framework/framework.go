@@ -38,11 +38,6 @@ type Framework struct {
 	// Multiple default mock servers used for e2e testing.
 	mockServers *MockServers
 
-	// To make sure that this framework cleans up after itself, no matter what,
-	// we install a Cleanup action before each test and clear it after.  If we
-	// should abort, the AfterSuite hook should run all Cleanup actions.
-	cleanupHandle CleanupActionHandle
-
 	// beforeEachStarted indicates that BeforeEach has started
 	beforeEachStarted bool
 
@@ -87,8 +82,6 @@ func NewFramework(opt Options) *Framework {
 func (f *Framework) BeforeEach() {
 	f.beforeEachStarted = true
 
-	f.cleanupHandle = AddCleanupAction(f.AfterEach)
-
 	dir, err := os.MkdirTemp(os.TempDir(), "frp-e2e-test-*")
 	ExpectNoError(err)
 	f.TempDirectory = dir
@@ -112,8 +105,6 @@ func (f *Framework) AfterEach() {
 	if !f.beforeEachStarted {
 		return
 	}
-
-	RemoveCleanupAction(f.cleanupHandle)
 
 	// stop processor
 	for _, p := range f.serverProcesses {
@@ -241,8 +232,29 @@ func (f *Framework) AllocPort() int {
 	return port
 }
 
-func (f *Framework) ReleasePort(port int) {
-	f.portAllocator.Release(port)
+func (f *Framework) AllocPortExcludingRanges(ranges ...[2]int) int {
+	for range 1000 {
+		port := f.portAllocator.Get()
+		ExpectTrue(port > 0, "alloc port failed")
+
+		inExcludedRange := false
+		for _, portRange := range ranges {
+			if port >= portRange[0] && port <= portRange[1] {
+				inExcludedRange = true
+				break
+			}
+		}
+		if inExcludedRange {
+			f.portAllocator.Release(port)
+			continue
+		}
+
+		f.allocatedPorts = append(f.allocatedPorts, port)
+		return port
+	}
+
+	Failf("alloc port outside excluded ranges failed")
+	return 0
 }
 
 func (f *Framework) RunServer(portName string, s server.Server) {

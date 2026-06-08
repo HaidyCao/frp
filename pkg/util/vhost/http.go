@@ -24,7 +24,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"strings"
 	"time"
 
 	libio "github.com/fatedier/golib/io"
@@ -160,7 +159,7 @@ func (rp *HTTPReverseProxy) UnRegister(routeCfg RouteConfig) {
 }
 
 func (rp *HTTPReverseProxy) GetRouteConfig(domain, location, routeByHTTPUser string) *RouteConfig {
-	vr, ok := rp.getVhost(domain, location, routeByHTTPUser)
+	vr, ok := rp.vhostRouter.getByRoute(domain, location, routeByHTTPUser)
 	if ok {
 		log.Debugf("get new http request host [%s] path [%s] httpuser [%s]", domain, location, routeByHTTPUser)
 		return vr.payload.(*RouteConfig)
@@ -171,7 +170,7 @@ func (rp *HTTPReverseProxy) GetRouteConfig(domain, location, routeByHTTPUser str
 // CreateConnection create a new connection by route config
 func (rp *HTTPReverseProxy) CreateConnection(reqRouteInfo *RequestRouteInfo, byEndpoint bool) (net.Conn, error) {
 	host, _ := httppkg.CanonicalHost(reqRouteInfo.Host)
-	vr, ok := rp.getVhost(host, reqRouteInfo.URL, reqRouteInfo.HTTPUser)
+	vr, ok := rp.vhostRouter.getByRoute(host, reqRouteInfo.URL, reqRouteInfo.HTTPUser)
 	if ok {
 		if byEndpoint {
 			fn := vr.payload.(*RouteConfig).CreateConnByEndpointFn
@@ -187,60 +186,25 @@ func (rp *HTTPReverseProxy) CreateConnection(reqRouteInfo *RequestRouteInfo, byE
 	return nil, fmt.Errorf("%v: %s %s %s", ErrNoRouteFound, host, reqRouteInfo.URL, reqRouteInfo.HTTPUser)
 }
 
-func (rp *HTTPReverseProxy) CheckAuth(domain, location, routeByHTTPUser, user, passwd string) bool {
-	vr, ok := rp.getVhost(domain, location, routeByHTTPUser)
-	if ok {
-		checkUser := vr.payload.(*RouteConfig).Username
-		checkPasswd := vr.payload.(*RouteConfig).Password
-		if (checkUser != "" || checkPasswd != "") && (checkUser != user || checkPasswd != passwd) {
+func checkRouteAuthByRequest(req *http.Request, rc *RouteConfig) bool {
+	if rc == nil {
+		return true
+	}
+	if rc.Username == "" && rc.Password == "" {
+		return true
+	}
+
+	if req.URL.Host != "" {
+		proxyAuth := req.Header.Get("Proxy-Authorization")
+		if proxyAuth == "" {
 			return false
 		}
-	}
-	return true
-}
-
-// getVhost tries to get vhost router by route policy.
-func (rp *HTTPReverseProxy) getVhost(domain, location, routeByHTTPUser string) (*Router, bool) {
-	findRouter := func(inDomain, inLocation, inRouteByHTTPUser string) (*Router, bool) {
-		vr, ok := rp.vhostRouter.Get(inDomain, inLocation, inRouteByHTTPUser)
-		if ok {
-			return vr, ok
-		}
-		// Try to check if there is one proxy that doesn't specify routerByHTTPUser, it means match all.
-		vr, ok = rp.vhostRouter.Get(inDomain, inLocation, "")
-		if ok {
-			return vr, ok
-		}
-		return nil, false
+		user, passwd, ok := httppkg.ParseBasicAuth(proxyAuth)
+		return ok && user == rc.Username && passwd == rc.Password
 	}
 
-	// First we check the full hostname
-	// if not exist, then check the wildcard_domain such as *.example.com
-	vr, ok := findRouter(domain, location, routeByHTTPUser)
-	if ok {
-		return vr, ok
-	}
-
-	// e.g. domain = test.example.com, try to match wildcard domains.
-	// *.example.com
-	// *.com
-	domainSplit := strings.Split(domain, ".")
-	for len(domainSplit) >= 3 {
-		domainSplit[0] = "*"
-		domain = strings.Join(domainSplit, ".")
-		vr, ok = findRouter(domain, location, routeByHTTPUser)
-		if ok {
-			return vr, true
-		}
-		domainSplit = domainSplit[1:]
-	}
-
-	// Finally, try to check if there is one proxy that domain is "*" means match all domains.
-	vr, ok = findRouter("*", location, routeByHTTPUser)
-	if ok {
-		return vr, true
-	}
-	return nil, false
+	user, passwd, ok := req.BasicAuth()
+	return ok && user == rc.Username && passwd == rc.Password
 }
 
 func (rp *HTTPReverseProxy) connectHandler(rw http.ResponseWriter, req *http.Request) {
@@ -266,18 +230,25 @@ func (rp *HTTPReverseProxy) connectHandler(rw http.ResponseWriter, req *http.Req
 	go libio.Join(remote, client)
 }
 
-func (rp *HTTPReverseProxy) injectRequestInfoToCtx(req *http.Request) *http.Request {
-	user := ""
-	// If url host isn't empty, it's a proxy request. Get http user from Proxy-Authorization header.
+func getRequestRouteUser(req *http.Request) string {
 	if req.URL.Host != "" {
 		proxyAuth := req.Header.Get("Proxy-Authorization")
-		if proxyAuth != "" {
-			user, _, _ = httppkg.ParseBasicAuth(proxyAuth)
+		if proxyAuth == "" {
+			// Preserve legacy proxy-mode routing when clients send only Authorization,
+			// so requests still hit the matched route and return 407 instead of 404.
+			// Auth validation intentionally does not share this fallback.
+			user, _, _ := req.BasicAuth()
+			return user
 		}
+		user, _, _ := httppkg.ParseBasicAuth(proxyAuth)
+		return user
 	}
-	if user == "" {
-		user, _, _ = req.BasicAuth()
-	}
+	user, _, _ := req.BasicAuth()
+	return user
+}
+
+func (rp *HTTPReverseProxy) injectRequestInfoToCtx(req *http.Request) *http.Request {
+	user := getRequestRouteUser(req)
 
 	reqRouteInfo := &RequestRouteInfo{
 		URL:        req.URL.Path,
@@ -297,16 +268,19 @@ func (rp *HTTPReverseProxy) injectRequestInfoToCtx(req *http.Request) *http.Requ
 }
 
 func (rp *HTTPReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	domain, _ := httppkg.CanonicalHost(req.Host)
-	location := req.URL.Path
-	user, passwd, _ := req.BasicAuth()
-	if !rp.CheckAuth(domain, location, user, user, passwd) {
-		rw.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
-		http.Error(rw, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+	newreq := rp.injectRequestInfoToCtx(req)
+	rc := newreq.Context().Value(RouteConfigKey).(*RouteConfig)
+	if !checkRouteAuthByRequest(req, rc) {
+		if req.URL.Host != "" {
+			rw.Header().Set("Proxy-Authenticate", `Basic realm="Restricted"`)
+			http.Error(rw, http.StatusText(http.StatusProxyAuthRequired), http.StatusProxyAuthRequired)
+		} else {
+			rw.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
+			http.Error(rw, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+		}
 		return
 	}
 
-	newreq := rp.injectRequestInfoToCtx(req)
 	if req.Method == http.MethodConnect {
 		rp.connectHandler(rw, newreq)
 	} else {
